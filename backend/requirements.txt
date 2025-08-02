@@ -1,0 +1,29 @@
+# --- Web Framework ---
+fastapi==0.104.1
+uvicorn[standard]==0.23.2
+starlette==0.27.0
+
+# --- ORM & DB Drivers ---
+sqlalchemy==2.0.21
+asyncpg
+psycopg2-binary==2.9.9
+alembic==1.12.0
+
+# --- Environment Config ---
+python-decouple==3.8
+python-dotenv==1.0.0
+pydantic-settings
+PyYAML==5.4.1
+
+# --- Auth & Security ---
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+pydantic[email]==1.10.13
+
+# --- Task Queue ---
+celery==5.3.4
+redis==5.0.1
+
+# --- Web Automation ---
+playwright==1.39.0
+requests==2.31.0
