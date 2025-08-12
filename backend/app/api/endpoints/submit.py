@@ -1,118 +1,106 @@
 # backend/app/api/endpoints/submit.py
 
-from fastapi import APIRouter, Depends, UploadFile, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, Request, Depends
+from fastapi.responses import StreamingResponse, JSONResponse
+import os, threading, traceback
 from sqlalchemy.orm import Session
-from fastapi.responses import JSONResponse
-
+from app.log_stream import event_generator, log
+from app.automation.browser_job import process_csv_and_submit
 from app.db.database import get_db
-from app.api.deps import get_current_user
-from app.automation.runner import run_campaign_automation
-from app.db.models.user import User
-from app.db.models.campaign import Campaign
-from app.utils.logger import log_event
-from app.db.models.log import Log
-
-import pandas as pd
-import tempfile
-import uuid
-from datetime import datetime
+from app.db.models.user_contact_profile import UserContactProfile
+# If you already have an auth dep that returns the current user, use it:
+# from app.api.deps import get_current_user
 
 router = APIRouter()
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def profile_to_dict(rec: UserContactProfile | None) -> dict:
+    if not rec:
+        return {}
+    # Convert SQLAlchemy row to a plain dict
+    return {c.name: getattr(rec, c.name) for c in rec.__table__.columns}
 
 @router.post("/start")
-def start_form_submission(
-    file: UploadFile,
+async def start_submission(
+    request: Request,
+    file: UploadFile = File(...),
     proxy: str = Form(""),
     haltOnCaptcha: bool = Form(True),
+    message: str = Form(""),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    # current_user = Depends(get_current_user),   # preferred if available
 ):
-    """
-    Initiates the form submission automation process.
-    """
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+    # 1) Save the CSV
+    file_path = os.path.join(UPLOAD_DIR, "websites.csv")
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
 
-    # ✅ Save and read the uploaded file
-    try:
-        contents = file.file.read().decode('utf-8')
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w+", encoding="utf-8") as tmp:
-            tmp.write(contents)
-            tmp_path = tmp.name
+    # 2) Resolve the logged-in user id
+    user_id = None
+    # If you have `current_user`, do: user_id = str(current_user.id)
+    if hasattr(request, "state") and hasattr(request.state, "user"):
+        u = request.state.user
+        if isinstance(u, dict):
+            user_id = u.get("sub") or u.get("id")
+        else:
+            user_id = getattr(u, "sub", None) or getattr(u, "id", None)
 
-        df = pd.read_csv(tmp_path)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to process CSV: {str(e)}")
+    # 3) Load the user's contact profile from DB
+    user_profile = {}
+    if user_id:
+        rec = db.query(UserContactProfile).filter(UserContactProfile.user_id == user_id).first()
+        user_profile = profile_to_dict(rec)
 
-    # ✅ Clean column names
-    df.columns = [col.strip() for col in df.columns]
+    # 4) Log a short preview so you can see it worked
+    log("----------------------------------------------")
+    log("Start request received")
+    log(f"Saved CSV to: {file_path}")
+    log(f"Proxy: {proxy}")
+    log(f"Halt on captcha: {haltOnCaptcha}")
+    log(f"Message length: {len(message or '')}")
+    if user_id:
+        log(f"Resolved user_id: {user_id}")
+    if user_profile:
+        log("Loaded user_contact_profile (preview):")
+        shown = 0
+        for k, v in user_profile.items():
+            if not v:
+                continue
+            s = str(v)
+            if len(s) > 200:
+                s = s[:200] + "…"
+            log(f"- {k}: {s}")
+            shown += 1
+            if shown >= 20:
+                log("…(truncated)")
+                break
+    else:
+        log("No user profile found for this user.")
+    log("----------------------------------------------")
 
-    # ✅ Detect valid website column
-    possible_columns = ["website", "Website", "domain", "url"]
-    detected_col = next((col for col in possible_columns if col in df.columns), None)
+    # 5) Run the automation fully detached (returns immediately)
+    def _worker():
+        try:
+            process_csv_and_submit(
+                csv_path=file_path,
+                proxy=proxy,
+                halt_on_captcha=haltOnCaptcha,
+                message=message,
+                user_profile=user_profile,
+            )
+        except Exception as e:
+            log("==============================================")
+            log("Background job crashed")
+            log("----------------------------------------------")
+            log(str(e))
+            log(traceback.format_exc())
+            log("==============================================")
 
-    if not detected_col:
-        raise HTTPException(
-            status_code=400,
-            detail=f"CSV must contain one of the following columns: {possible_columns}. Found: {list(df.columns)}"
-        )
+    threading.Thread(target=_worker, daemon=True).start()
+    return JSONResponse({"message": "started"})
 
-    websites = df[detected_col].dropna().astype(str).str.strip().tolist()
-
-    if not websites:
-        raise HTTPException(status_code=400, detail="No valid website URLs found in the CSV.")
-
-    # ✅ Create campaign
-    campaign_id = str(uuid.uuid4())
-    campaign = Campaign(
-        id=campaign_id,
-        user_id=current_user.id,
-        name=f"Campaign - {file.filename}",
-        csv_filename=file.filename,
-        started_at=datetime.utcnow(),
-        status="started"
-    )
-    db.add(campaign)
-    db.commit()
-
-    # ✅ Log creation
-    log_event(
-        db=db,
-        user_id=str(current_user.id),
-        message=f"✅ Campaign created and file parsed using '{detected_col}' column.",
-        campaign_id=campaign_id
-    )
-
-    # ✅ Trigger automation
-    run_campaign_automation(
-        websites=websites,
-        proxy=proxy,
-        halt_on_captcha=haltOnCaptcha,
-        user_id=str(current_user.id),
-        campaign_id=campaign_id,
-        db=db
-    )
-
-    return JSONResponse(content={
-        "message": "✅ Campaign submission started.",
-        "campaign_id": campaign_id,
-        "total_websites": len(websites)
-    })
-
-
-@router.get("/logs/latest")
-def get_latest_submission_logs(
-    limit: int = 50,
-    campaign_id: str = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Returns latest log lines for the current user and optional campaign.
-    """
-    query = db.query(Log).filter(Log.user_id == current_user.id)
-    if campaign_id:
-        query = query.filter(Log.campaign_id == campaign_id)
-
-    logs = query.order_by(Log.timestamp.desc()).limit(limit).all()
-    return logs
+@router.get("/logs/stream")
+async def stream_logs(request: Request):
+    return StreamingResponse(event_generator(request), media_type="text/event-stream")
