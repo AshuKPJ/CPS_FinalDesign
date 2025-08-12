@@ -1,34 +1,46 @@
 # backend/app/automation/form_detector.py
 
-from playwright.async_api import async_playwright
 
-async def detect_form_on_page(url: str) -> dict:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+from typing import Dict, Any
+from playwright.sync_api import Page
 
+def detect_contact_form(page: Page) -> Dict[str, Any]:
+    """
+    Returns info about the first 'real' contact form, ignoring search/newsletter if possible.
+    """
+    try:
+        forms = page.locator("form")
+        n = forms.count()
+    except Exception:
+        n = 0
+
+    if n == 0:
+        return {"has_form": False}
+
+    # pick the first form that looks like a contact form, not search
+    for i in range(min(n, 5)):
+        f = forms.nth(i)
         try:
-            await page.goto(url, timeout=20000)
-            forms = await page.query_selector_all("form")
-            form_data = []
+            html = f.evaluate("el => el.outerHTML.toLowerCase()")
+        except Exception:
+            html = ""
 
-            for form in forms:
-                form_info = {
-                    "action": await form.get_attribute("action"),
-                    "method": await form.get_attribute("method"),
-                    "fields": []
-                }
-                inputs = await form.query_selector_all("input, textarea, select")
-                for input_elem in inputs:
-                    name = await input_elem.get_attribute("name")
-                    typ = await input_elem.get_attribute("type") or input_elem.evaluate("el => el.tagName")
-                    form_info["fields"].append({"name": name, "type": typ})
-                form_data.append(form_info)
+        # quick heuristics
+        looks_search = ("search" in html) and ("type=\"search\"" in html or "name=\"s\"" in html)
+        looks_newsletter = ("newsletter" in html) and ("email" in html)
+        has_textarea = "<textarea" in html
+        has_submit = ("type=\"submit\"" in html) or ("role=\"button\"" in html) or ("<button" in html)
 
-            return {"forms": form_data, "status": "success" if form_data else "no_forms"}
+        if looks_search or (looks_newsletter and not has_textarea):
+            continue
 
-        except Exception as e:
-            return {"error": str(e), "status": "error"}
+        if has_submit:
+            return {
+                "has_form": True,
+                "index": i,
+                "has_textarea": has_textarea,
+                "has_submit": has_submit
+            }
 
-        finally:
-            await browser.close()
+    # fallback
+    return {"has_form": True, "index": 0, "has_textarea": False, "has_submit": True}

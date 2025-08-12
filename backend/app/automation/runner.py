@@ -1,127 +1,124 @@
 # backend/app/automation/runner.py
 
-import asyncio
-import csv
-import io
-import uuid
-from typing import List
-from datetime import datetime
-import pandas as pd
-from sqlalchemy.orm import Session
-from app.utils.logger import log_event
-from app.automation.browser_utils import launch_browser, close_browser, open_page
-from app.automation.form_detector import detect_form_on_page
-from app.automation.field_mapper import map_fields_and_fill
-from app.db.models.campaign import Campaign
-from app.db.models.user_contact_profile import UserContactProfile
-from app.db.models.website import Website
-from app.db.models.submission import Submission
-from playwright.async_api import async_playwright
+import traceback
+from pathlib import Path
+from typing import List, Dict, Optional
+from app.log_stream import log
+from .system_utils import ensure_windows_proactor_policy
+from .config import PROFILE_DIR, SCREENSHOTS_DIR, NAV_TIMEOUT_MS, BROWSER_NAME
+from .csv_utils import read_csv_safely, extract_websites
+from .browser_engine import launch_browser, close_browser
+from .website_worker import process_single_site
 
-def run_campaign_automation(file, proxy: str, halt_on_captcha: bool, user_id: str, db: Session):
-    # Step 1: Parse CSV and extract websites
-    contents = file.file.read().decode("utf-8")
-    file.file.close()
-    df = pd.read_csv(io.StringIO(contents))
+def process_csv_and_submit(
+    csv_path: str,
+    proxy: str = "",
+    halt_on_captcha: bool = True,
+    message: str = "",
+    user_profile: Optional[Dict] = None
+) -> None:
+    try:
+        log("")
+        log("==============================================")
+        log("Starting browser automation job")
+        log("==============================================")
 
-    if 'website' not in df.columns and 'Website' not in df.columns:
-        raise ValueError("CSV must contain a 'website' or 'Website' column.")
+        ensure_windows_proactor_policy()
 
-    website_column = 'website' if 'website' in df.columns else 'Website'
-    websites = df[website_column].dropna().unique().tolist()
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Step 2: Create campaign record
-    campaign = Campaign(
-        id=uuid.uuid4(),
-        user_id=user_id,
-        name=f"Campaign {datetime.utcnow().isoformat()[:19]}",
-        csv_filename=file.filename,
-        started_at=datetime.utcnow(),
-        status="processing"
-    )
-    db.add(campaign)
-    db.commit()
-    db.refresh(campaign)
+        df = read_csv_safely(csv_path)
+        log(f"CSV read successfully. Shape: {df.shape}")
+        websites: List[str] = extract_websites(df)
+        if not websites:
+            log("No valid websites to process. Exiting.")
+            return
 
-    campaign_id = str(campaign.id)
-    log_event(db, user_id, "Campaign and CSV parsed. Starting automation...", campaign_id=campaign_id)
-
-    # Step 3: Begin async processing
-    asyncio.run(run_campaign_automation_async(websites, proxy, halt_on_captcha, user_id, campaign_id, db))
-
-
-async def run_campaign_automation_async(websites: List[str], proxy: str, halt_on_captcha: bool, user_id: str, campaign_id: str, db: Session):
-    from app.db.models.user_contact_profile import UserContactProfile
-    from app.db.models.website import Website
-    from app.db.models.submission import Submission
-
-    log_event(db, user_id, "Automation started.", campaign_id=campaign_id)
-
-    async with async_playwright() as p:
-        browser = await launch_browser(p, proxy)
-
-        for index, domain in enumerate(websites):
-            try:
-                log_event(db, user_id, f"Opening site #{index+1}: {domain}", campaign_id=campaign_id)
-
-                page = await open_page(browser, domain)
-                if not page:
-                    log_event(db, user_id, f"❌ Failed to open {domain}", campaign_id=campaign_id)
+        # 🔍 NEW: show the profile we’ll use (sanitized)
+        profile = dict(user_profile or {})
+        if profile:
+            log("----------------------------------------------")
+            log("Loaded user_contact_profile (sanitized):")
+            for k, v in profile.items():
+                if v is None or v == "":
                     continue
+                # avoid logging very long values verbatim
+                sv = str(v)
+                if len(sv) > 200:
+                    sv = sv[:200] + "…"
+                log(f"- {k}: {sv}")
+            log("----------------------------------------------")
+        else:
+            log("No user_profile provided; will fill only basic fields.")
 
-                form_info = await detect_form_on_page(page)
-                website_id = uuid.uuid4()
+        log("")
+        log("----------------------------------------------")
+        log("Step 4 - Launching Browser")
+        log(f"Config - NAV_TIMEOUT_MS={NAV_TIMEOUT_MS}")
+        if proxy:
+            log(f"Config - PROXY={proxy}")
+        log(f"Browser engine: {BROWSER_NAME}")
 
-                website = Website(
-                    id=website_id,
-                    campaign_id=campaign_id,
-                    domain=domain,
-                    user_id=user_id,
-                    form_detected=bool(form_info),
-                    status="form_detected" if form_info else "no_form",
-                    created_at=datetime.utcnow()
+        context, page, browser, p = launch_browser(proxy)
+
+        total = len(websites)
+        log("----------------------------------------------")
+        log(f"Step 5 - Processing Websites (total: {total})")
+
+        success_count = 0
+        fail_count = 0
+        email_only_count = 0
+
+        for idx, raw_url in enumerate(websites, start=1):
+            try:
+                result = process_single_site(
+                    page=page,
+                    raw_url=raw_url,
+                    idx=idx,
+                    screenshots_dir=SCREENSHOTS_DIR,
+                    halt_on_captcha=halt_on_captcha,
+                    message=message or profile.get("message", "") or "Hello from automation",
+                    user_profile=profile,
                 )
-                db.add(website)
-                db.commit()
-
-                if form_info:
-                    log_event(db, user_id, f"Form detected on {domain} with fields: {form_info['fields']}", campaign_id=campaign_id, website_id=website_id)
-
-                    profile = db.query(UserContactProfile).filter_by(user_id=user_id).first()
-                    if not profile:
-                        log_event(db, user_id, f"⚠️ User contact profile missing.", campaign_id=campaign_id, website_id=website_id)
-                        continue
-
-                    await map_fields_and_fill(page, form_info['fields'], profile)
-
-                    if form_info['has_captcha']:
-                        log_event(db, user_id, f"🛑 CAPTCHA found on {domain}", campaign_id=campaign_id, website_id=website_id)
-                        if halt_on_captcha:
-                            log_event(db, user_id, "Halting due to CAPTCHA", campaign_id=campaign_id, website_id=website_id)
-                            break
-
-                    await page.click(form_info['submit_selector'])
-                    log_event(db, user_id, f"✅ Submitted form on {domain}", campaign_id=campaign_id, website_id=website_id)
-
-                    submission = Submission(
-                        id=uuid.uuid4(),
-                        website_id=website_id,
-                        user_id=user_id,
-                        success=True,
-                        submitted_at=datetime.utcnow(),
-                        form_fields_sent={"fields": form_info['fields']},
-                        response_status=200
-                    )
-                    db.add(submission)
-                    db.commit()
-                else:
-                    log_event(db, user_id, f"❌ No form found on {domain}", campaign_id=campaign_id, website_id=website_id)
-
-                await page.close()
+                status = result.get("status") if isinstance(result, dict) else None
+                if status == "form_success":
+                    success_count += 1
+                elif status == "form_fail":
+                    fail_count += 1
+                elif status == "email_only":
+                    email_only_count += 1
 
             except Exception as e:
-                log_event(db, user_id, f"🔥 Error processing {domain}: {str(e)}", campaign_id=campaign_id, level="ERROR")
+                err = str(e).lower()
+                is_captcha = any(k in err for k in ("captcha", "recaptcha", "hcaptcha"))
+                if is_captcha and halt_on_captcha:
+                    log("Possible CAPTCHA encountered; halting because halt_on_captcha=True")
+                    break
+                try:
+                    page.screenshot(path=str(SCREENSHOTS_DIR / f"row{idx}_error.png"), full_page=False)
+                except Exception:
+                    pass
+                log(f"Unhandled error for {raw_url}: {e}. Continuing to next URL.")
                 continue
 
-        await close_browser(browser)
-        log_event(db, user_id, "🎉 Automation finished.", campaign_id=campaign_id)
+        log("----------------------------------------------")
+        log(f"Automation complete: {success_count} form submissions succeeded, "
+            f"{fail_count} failed, {email_only_count} contacted via email.")
+
+        close_browser(context, browser, p)
+
+    except Exception:
+        log("")
+        log("==============================================")
+        log("Critical error in automation")
+        log("----------------------------------------------")
+        log(traceback.format_exc())
+        log("==============================================")
+
+if __name__ == "__main__":
+    import sys
+    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "uploads/websites.csv"
+    proxy_arg = sys.argv[2] if len(sys.argv) > 2 else ""
+    halt_arg = (sys.argv[3].lower() == "true") if len(sys.argv) > 3 else True
+    process_csv_and_submit(csv_arg, proxy_arg, halt_arg)
