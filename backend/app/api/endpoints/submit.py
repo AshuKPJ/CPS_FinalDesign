@@ -1,94 +1,107 @@
-# backend/app/api/endpoints/submit.py
-
-from fastapi import APIRouter, UploadFile, File, Form, Request, Depends
+from fastapi import APIRouter, UploadFile, File, Form, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 import os, threading, traceback
 from sqlalchemy.orm import Session
+
 from app.log_stream import event_generator, log
 from app.automation.browser_job import process_csv_and_submit
 from app.db.database import get_db
+from app.api.deps import get_current_active_user
 from app.db.models.user_contact_profile import UserContactProfile
-# If you already have an auth dep that returns the current user, use it:
-# from app.api.deps import get_current_user
+from app.db.models.user import User
 
 router = APIRouter()
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-def profile_to_dict(rec: UserContactProfile | None) -> dict:
-    if not rec:
+def _row_to_dict(row) -> dict:
+    if not row:
         return {}
-    # Convert SQLAlchemy row to a plain dict
-    return {c.name: getattr(rec, c.name) for c in rec.__table__.columns}
+    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+def _summarize_profile(prefix: str, d: dict):
+    non_empty = {k: v for k, v in d.items() if v not in (None, "", False)}
+    log(f"{prefix}: {len(non_empty)} non-empty fields")
+    shown = 0
+    for k, v in non_empty.items():
+        s = str(v)
+        if len(s) > 200:
+            s = s[:200] + "…"
+        log(f"  · {k}: {s}")
+        shown += 1
+        if shown >= 20:
+            log("  · …(truncated)")
+            break
 
 @router.post("/start")
 async def start_submission(
-    request: Request,
     file: UploadFile = File(...),
     proxy: str = Form(""),
     haltOnCaptcha: bool = Form(True),
     message: str = Form(""),
     db: Session = Depends(get_db),
-    # current_user = Depends(get_current_user),   # preferred if available
+    current_user = Depends(get_current_active_user),
 ):
-    # 1) Save the CSV
+    # Save CSV
     file_path = os.path.join(UPLOAD_DIR, "websites.csv")
     content = await file.read()
     with open(file_path, "wb") as f:
         f.write(content)
 
-    # 2) Resolve the logged-in user id
-    user_id = None
-    # If you have `current_user`, do: user_id = str(current_user.id)
-    if hasattr(request, "state") and hasattr(request.state, "user"):
-        u = request.state.user
-        if isinstance(u, dict):
-            user_id = u.get("sub") or u.get("id")
-        else:
-            user_id = getattr(u, "sub", None) or getattr(u, "id", None)
-
-    # 3) Load the user's contact profile from DB
-    user_profile = {}
-    if user_id:
-        rec = db.query(UserContactProfile).filter(UserContactProfile.user_id == user_id).first()
-        user_profile = profile_to_dict(rec)
-
-    # 4) Log a short preview so you can see it worked
+    # --- Deep auth / DB logs
+    user_id = str(current_user.id)
     log("----------------------------------------------")
     log("Start request received")
     log(f"Saved CSV to: {file_path}")
     log(f"Proxy: {proxy}")
     log(f"Halt on captcha: {haltOnCaptcha}")
     log(f"Message length: {len(message or '')}")
-    if user_id:
-        log(f"Resolved user_id: {user_id}")
+    log(f"Resolved user_id (from auth): {user_id}")
+
+    # Load contact profile for this user
+    profile_row = (
+        db.query(UserContactProfile)
+        .filter(UserContactProfile.user_id == current_user.id)
+        .first()
+    )
+    user_profile = _row_to_dict(profile_row)
+
     if user_profile:
-        log("Loaded user_contact_profile (preview):")
-        shown = 0
-        for k, v in user_profile.items():
-            if not v:
-                continue
-            s = str(v)
-            if len(s) > 200:
-                s = s[:200] + "…"
-            log(f"- {k}: {s}")
-            shown += 1
-            if shown >= 20:
-                log("…(truncated)")
-                break
+        _summarize_profile("Loaded user_contact_profile", user_profile)
     else:
-        log("No user profile found for this user.")
+        log("No user_contact_profiles row found for this user; falling back to basic user fields.")
+
+        # Fallback: pull basic fields from users table
+        user_row = db.query(User).filter(User.id == current_user.id).first()
+        fallback = {}
+        if user_row:
+            fallback = {
+                "first_name": user_row.first_name or "",
+                "last_name": user_row.last_name or "",
+                "email": user_row.email or "",
+            }
+        user_profile = fallback
+        if user_profile:
+            _summarize_profile("Fallback (users table)", user_profile)
+        else:
+            log("Fallback produced no data (unexpected).")
+
     log("----------------------------------------------")
 
-    # 5) Run the automation fully detached (returns immediately)
+    # Detach long-running job
     def _worker():
         try:
+            # ensure message is present in the dict if user typed one
+            profile = dict(user_profile or {})
+            if message and message.strip():
+                profile["message"] = message.strip()
+
             process_csv_and_submit(
                 csv_path=file_path,
                 proxy=proxy,
                 halt_on_captcha=haltOnCaptcha,
                 message=message,
-                user_profile=user_profile,
+                user_profile=profile,
             )
         except Exception as e:
             log("==============================================")
@@ -102,5 +115,5 @@ async def start_submission(
     return JSONResponse({"message": "started"})
 
 @router.get("/logs/stream")
-async def stream_logs(request: Request):
+async def stream_logs(request):
     return StreamingResponse(event_generator(request), media_type="text/event-stream")
