@@ -1,4 +1,6 @@
-from sqlalchemy import Column, String, Text, Boolean, ForeignKey
+# app/db/models/user_contact_profile.py
+
+from sqlalchemy import Column, String, Text, Boolean, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.db.base_class import Base
@@ -6,9 +8,13 @@ import uuid
 
 class UserContactProfile(Base):
     __tablename__ = "user_contact_profiles"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_user_contact_profiles_user_id"),
+        Index("ix_user_contact_profiles_user_id", "user_id"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
 
     first_name = Column(String(100), nullable=True)
     last_name = Column(String(100), nullable=True)
@@ -27,7 +33,7 @@ class UserContactProfile(Base):
     best_time_to_contact = Column(String(100), nullable=True)
     budget_range = Column(String(100), nullable=True)
     product_interest = Column(String(150), nullable=True)
-    is_existing_customer = Column(Boolean, default=False)
+    is_existing_customer = Column(Boolean, nullable=True, default=False)
 
     country = Column(String, nullable=True)
     language = Column(String, nullable=True)
@@ -43,5 +49,7 @@ class UserContactProfile(Base):
     region = Column(String, nullable=True)
     zip_code = Column(String, nullable=True)
 
-    #user = relationship("User", backref="contact_profile")
-    user = relationship("User", back_populates="contact_profile")
+    user = relationship("User", back_populates="contact_profile", uselist=False)
+
+    def to_dict(self) -> dict:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
