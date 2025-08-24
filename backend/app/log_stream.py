@@ -1,26 +1,44 @@
 # backend/app/log_stream.py
 from fastapi import Request
-from typing import List
-import asyncio
+from fastapi.responses import StreamingResponse
+from typing import List, Dict
+import asyncio, time, threading, uuid
+from collections import deque
 
-log_queue: List[str] = []
+class LogStream:
+    def __init__(self, maxlen: int = 2000):
+        self.q = deque(maxlen=maxlen)
+        self.lock = threading.Lock()
 
-def log(message: str):
-    # trim and ignore empty/whitespace-only messages
-    msg = (message or "").strip()
-    if not msg:
-        return
-    print(msg)
-    log_queue.append(msg)
+    def log(self, msg: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg.strip()}"
+        print(line)
+        with self.lock:
+            self.q.append(line)
 
-async def event_generator(request: Request):
-    last_index = 0
-    while True:
-        if await request.is_disconnected():
-            break
-        await asyncio.sleep(0.5)
-        if last_index < len(log_queue):
-            new_logs = log_queue[last_index:]
-            last_index = len(log_queue)
-            for line in new_logs:
-                yield f"data: {line}\n\n"
+    def snapshot(self, start: int = 0):
+        with self.lock:
+            arr = list(self.q)
+        n = len(arr)
+        if start >= n:
+            return [], n
+        return arr[start:], n
+
+stream = LogStream()
+
+def log(msg: str): stream.log(msg)
+
+def _sse(line: str) -> str:
+    return "data: " + line.replace("\n","\\n") + "\n\n"
+
+async def event_generator(request: Request) -> StreamingResponse:
+    async def gen():
+        idx = 0
+        yield _sse("🔗 Connected to CPS log stream.")
+        while True:
+            if await request.is_disconnected(): break
+            lines, idx = stream.snapshot(idx)
+            for ln in lines: yield _sse(ln)
+            await asyncio.sleep(0.5)
+    return StreamingResponse(gen(), media_type="text/event-stream")

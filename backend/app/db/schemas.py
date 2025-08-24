@@ -1,97 +1,180 @@
-#backend/app/db/schemas.py
+from __future__ import annotations
 
-from pydantic import BaseModel, EmailStr
 from datetime import datetime
-from typing import Optional, List
+from typing import List, Optional, Dict, Any
 from uuid import UUID
-from .models.user import UserRole
+from pydantic import BaseModel, EmailStr, SecretStr
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Auth / Tokens
+# ─────────────────────────────────────────────────────────────────────────────
 
-# --- User Schemas ---
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Users
+# ─────────────────────────────────────────────────────────────────────────────
+
 class UserBase(BaseModel):
     email: EmailStr
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-
+    role: Optional[str] = "user"
+    is_active: Optional[bool] = True
 
 class UserCreate(UserBase):
-    password: str
-    role: Optional[UserRole] = UserRole.user
-
-
-class UserLogin(BaseModel):
-    email: EmailStr
+    # Used by /auth/register
     password: str
 
-
-class UserOut(UserBase):
+class User(UserBase):
     id: UUID
-    role: UserRole
-    is_active: bool
+    plan_id: Optional[UUID] = None
+    subscription_status: Optional[str] = None
+    subscription_start: Optional[datetime] = None
+    subscription_end: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    profile_image_url: Optional[str] = None
+    class Config:
+        from_attributes = True  # map from ORM
 
-    model_config = {
-        "from_attributes": True  # Pydantic v2 replacement for orm_mode
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# Campaigns
+# ─────────────────────────────────────────────────────────────────────────────
 
+class CampaignCreate(BaseModel):
+    # Your current endpoint posts name + websites (and optionally message_template)
+    name: str
+    websites: List[str] = []
+    message_template: Optional[str] = None
 
-# --- Token Schemas ---
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    user: UserOut  # ✅ Added to match your actual login response
+class Campaign(BaseModel):
+    id: UUID
+    user_id: Optional[UUID] = None
+    name: Optional[str] = None
+    csv_filename: Optional[str] = None
+    started_at: Optional[datetime] = None
+    status: Optional[str] = None
+    class Config:
+        from_attributes = True
 
-class TokenData(BaseModel):
-    email: Optional[str] = None
+# ─────────────────────────────────────────────────────────────────────────────
+# Submissions (used by dashboards/joins; endpoint schema not required right now)
+# ─────────────────────────────────────────────────────────────────────────────
 
+class Submission(BaseModel):
+    id: UUID
+    user_id: Optional[UUID] = None
+    website_id: Optional[UUID] = None
+    campaign_id: Optional[UUID] = None
+    status: Optional[str] = None
+    success: Optional[bool] = None
+    response_status: Optional[int] = None
+    submitted_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    form_fields_sent: Optional[Dict[str, Any]] = None
+    class Config:
+        from_attributes = True
 
-# --- UserContactProfile Schemas ---
+# ─────────────────────────────────────────────────────────────────────────────
+# Submission Logs (dashboards)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class UserContactProfileBase(BaseModel):
-    first_name: Optional[str]
-    last_name: Optional[str]
-    company_name: Optional[str]
-    job_title: Optional[str]
-    email: Optional[EmailStr]
-    phone_number: Optional[str]
-    website_url: Optional[str]
-    subject: Optional[str]
-    referral_source: Optional[str]
-    message: Optional[str]
-    preferred_contact: Optional[str]
-    city: Optional[str]
-    state: Optional[str]
-    industry: Optional[str]
-    best_time_to_contact: Optional[str]
-    budget_range: Optional[str]
-    product_interest: Optional[str]
-    is_existing_customer: Optional[bool] = False
-    country: Optional[str]
-    language: Optional[str]
-    timezone: Optional[str]
-    linkedin_url: Optional[str]
-    notes: Optional[str]
-    form_custom_field_1: Optional[str]
-    form_custom_field_2: Optional[str]
-    form_custom_field_3: Optional[str]
-    contact_source: Optional[str]
-    preferred_language: Optional[str]
-    region: Optional[str]
-    zip_code: Optional[str]
+class SubmissionLog(BaseModel):
+    id: UUID
+    campaign_id: Optional[UUID] = None
+    target_url: str
+    status: Optional[str] = None
+    details: Optional[str] = None
+    processed_at: Optional[datetime] = None
+    class Config:
+        from_attributes = True
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Captcha settings (users.py)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class UserContactProfileCreate(UserContactProfileBase):
-    user_id: UUID
+class CaptchaView(BaseModel):
+    has_captcha: bool
+    captcha_username: Optional[str] = None
+    captcha_password: Optional[str] = None  # echoed back as plain for UI
 
+class CaptchaUpdate(BaseModel):
+    captcha_username: Optional[str] = None
+    captcha_password: Optional[SecretStr] = None
 
-class UserContactProfileUpdate(UserContactProfileBase):
-    pass
+# ─────────────────────────────────────────────────────────────────────────────
+# User Contact Profile (user_contact_profile.py)
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-class UserContactProfileOut(UserContactProfileBase):
+class UserContactProfileOut(BaseModel):
     id: UUID
     user_id: UUID
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    phone_number: Optional[str] = None
+    company_name: Optional[str] = None
+    job_title: Optional[str] = None
+    website_url: Optional[str] = None
+    industry: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
+    country: Optional[str] = None
+    region: Optional[str] = None
+    timezone: Optional[str] = None
+    subject: Optional[str] = None
+    message: Optional[str] = None
+    product_interest: Optional[str] = None
+    budget_range: Optional[str] = None
+    referral_source: Optional[str] = None
+    preferred_contact: Optional[str] = None
+    best_time_to_contact: Optional[str] = None
+    is_existing_customer: Optional[bool] = None
+    linkedin_url: Optional[str] = None
+    language: Optional[str] = None
+    preferred_language: Optional[str] = None
+    notes: Optional[str] = None
+    contact_source: Optional[str] = None
+    form_custom_field_1: Optional[str] = None
+    form_custom_field_2: Optional[str] = None
+    form_custom_field_3: Optional[str] = None
+    class Config:
+        from_attributes = True
 
-    model_config = {
-        "from_attributes": True  # Enables .from_orm() behavior
-    }
+class UserContactProfileUpdate(BaseModel):
+    # All fields optional for partial upsert
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    phone_number: Optional[str] = None
+    company_name: Optional[str] = None
+    job_title: Optional[str] = None
+    website_url: Optional[str] = None
+    industry: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
+    country: Optional[str] = None
+    region: Optional[str] = None
+    timezone: Optional[str] = None
+    subject: Optional[str] = None
+    message: Optional[str] = None
+    product_interest: Optional[str] = None
+    budget_range: Optional[str] = None
+    referral_source: Optional[str] = None
+    preferred_contact: Optional[str] = None
+    best_time_to_contact: Optional[str] = None
+    is_existing_customer: Optional[bool] = None
+    linkedin_url: Optional[str] = None
+    language: Optional[str] = None
+    preferred_language: Optional[str] = None
+    notes: Optional[str] = None
+    contact_source: Optional[str] = None
+    form_custom_field_1: Optional[str] = None
+    form_custom_field_2: Optional[str] = None
+    form_custom_field_3: Optional[str] = None

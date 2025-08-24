@@ -14,19 +14,23 @@ def get_owner_dashboard_stats(
     current_user: models.User = Depends(deps.get_current_owner_user),
 ):
     """
-    Get high-level platform statistics for the Owner dashboard.
+    High-level platform statistics for the Owner dashboard.
     """
     total_users = db.query(func.count(models.User.id)).scalar()
     total_campaigns = db.query(func.count(models.Campaign.id)).scalar()
-    
-    successful_submissions = db.query(func.count(models.SubmissionLog.id)).filter(
-        models.SubmissionLog.status == models.SubmissionStatus.success
-    ).scalar()
-    
+
+    successful_submissions = (
+        db.query(func.count(models.SubmissionLog.id))
+        .filter(models.SubmissionLog.status == "success")   # string instead of enum
+        .scalar()
+    )
+
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    new_users_last_30_days = db.query(func.count(models.User.id)).filter(
-        models.User.created_at >= thirty_days_ago
-    ).scalar()
+    new_users_last_30_days = (
+        db.query(func.count(models.User.id))
+        .filter(models.User.created_at >= thirty_days_ago)   # created_at exists
+        .scalar()
+    )
 
     return {
         "total_users": total_users,

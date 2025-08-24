@@ -1,119 +1,150 @@
-from fastapi import APIRouter, UploadFile, File, Form, Depends
-from fastapi.responses import StreamingResponse, JSONResponse
-import os, threading, traceback
+from __future__ import annotations
+
+import os
+import traceback
+import uuid
+from typing import Dict, Any
+
+from fastapi import (
+    APIRouter,
+    UploadFile,
+    File,
+    Form,
+    Depends,
+    Request,
+    BackgroundTasks,
+    HTTPException,
+)
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
 from app.log_stream import event_generator, log
-from app.automation.browser_job import process_csv_and_submit
 from app.db.database import get_db
 from app.api.deps import get_current_active_user
 from app.db.models.user_contact_profile import UserContactProfile
 from app.db.models.user import User
 
-router = APIRouter()
+router = APIRouter(tags=["Submit"])
+
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-def _row_to_dict(row) -> dict:
+def _row_to_dict(row) -> Dict[str, Any]:
     if not row:
         return {}
     return {c.name: getattr(row, c.name) for c in row.__table__.columns}
 
-def _summarize_profile(prefix: str, d: dict):
-    non_empty = {k: v for k, v in d.items() if v not in (None, "", False)}
-    log(f"{prefix}: {len(non_empty)} non-empty fields")
-    shown = 0
-    for k, v in non_empty.items():
-        s = str(v)
-        if len(s) > 200:
-            s = s[:200] + "…"
-        log(f"  · {k}: {s}")
-        shown += 1
-        if shown >= 20:
-            log("  · …(truncated)")
-            break
-
 @router.post("/start")
 async def start_submission(
+    request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     proxy: str = Form(""),
     haltOnCaptcha: bool = Form(True),
     message: str = Form(""),
+    useCaptcha: bool = Form(False),
+    showBrowser: bool = Form(False),   # <-- NEW: show real browser window
+    trace: bool = Form(False),         # <-- NEW: record Playwright trace.zip
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_active_user),
+    current_user: User = Depends(get_current_active_user),
 ):
-    # Save CSV
-    file_path = os.path.join(UPLOAD_DIR, "websites.csv")
+    rid = str(uuid.uuid4())[:8]
+    log("")
+    log("==============================================")
+    log(f"▶️  [{rid}] /submit/start invoked")
+
+    if not file:
+        raise HTTPException(status_code=400, detail="CSV file is required")
+
+    # Save uploaded CSV
+    file_path = os.path.join(UPLOAD_DIR, f"websites_{rid}.csv")
     content = await file.read()
     with open(file_path, "wb") as f:
         f.write(content)
 
-    # --- Deep auth / DB logs
-    user_id = str(current_user.id)
-    log("----------------------------------------------")
-    log("Start request received")
-    log(f"Saved CSV to: {file_path}")
-    log(f"Proxy: {proxy}")
-    log(f"Halt on captcha: {haltOnCaptcha}")
-    log(f"Message length: {len(message or '')}")
-    log(f"Resolved user_id (from auth): {user_id}")
+    # Build user_profile (include CAPTCHA creds if present)
+    user_profile: Dict[str, Any] = {}
+    try:
+        profile_row = (
+            db.query(UserContactProfile)
+            .filter(UserContactProfile.user_id == current_user.id)
+            .first()
+        )
+        user_profile = _row_to_dict(profile_row) if profile_row else {}
+    except Exception:
+        user_profile = {}
 
-    # Load contact profile for this user
-    profile_row = (
-        db.query(UserContactProfile)
-        .filter(UserContactProfile.user_id == current_user.id)
-        .first()
+    # Minimum identity fallbacks
+    user_profile.setdefault("first_name", getattr(current_user, "first_name", "") or "")
+    user_profile.setdefault("last_name", getattr(current_user, "last_name", "") or "")
+    user_profile.setdefault("email", getattr(current_user, "email", "") or "")
+    if message and message.strip():
+        user_profile["message"] = message.strip()
+
+    # Optional per-user CAPTCHA creds
+    for fld in ("captcha_username", "captcha_password"):
+        val = getattr(current_user, fld, None)
+        if val:
+            user_profile[fld] = val
+
+    log(
+        f"Options: proxy={bool(proxy)} haltOnCaptcha={haltOnCaptcha} "
+        f"useCaptcha={useCaptcha} msg_len={len(message or '')}"
     )
-    user_profile = _row_to_dict(profile_row)
 
-    if user_profile:
-        _summarize_profile("Loaded user_contact_profile", user_profile)
-    else:
-        log("No user_contact_profiles row found for this user; falling back to basic user fields.")
-
-        # Fallback: pull basic fields from users table
-        user_row = db.query(User).filter(User.id == current_user.id).first()
-        fallback = {}
-        if user_row:
-            fallback = {
-                "first_name": user_row.first_name or "",
-                "last_name": user_row.last_name or "",
-                "email": user_row.email or "",
-            }
-        user_profile = fallback
-        if user_profile:
-            _summarize_profile("Fallback (users table)", user_profile)
-        else:
-            log("Fallback produced no data (unexpected).")
-
-    log("----------------------------------------------")
-
-    # Detach long-running job
-    def _worker():
+    def run_worker(
+        rid_local: str,
+        csv_path: str,
+        proxy_opt: str,
+        halt: bool,
+        msg: str,
+        use_cap: bool,
+        owner_id,
+        show_browser: bool,
+        do_trace: bool,
+    ):
+        from app.automation.core.runner import process_csv_and_submit
         try:
-            # ensure message is present in the dict if user typed one
-            profile = dict(user_profile or {})
-            if message and message.strip():
-                profile["message"] = message.strip()
-
             process_csv_and_submit(
-                csv_path=file_path,
-                proxy=proxy,
-                halt_on_captcha=haltOnCaptcha,
-                message=message,
-                user_profile=profile,
+                csv_path=csv_path,
+                proxy=proxy_opt,
+                halt_on_captcha=halt,
+                message=msg,
+                user_profile=user_profile,
+                use_captcha_solver=use_cap,
+                headless=show_browser,                      # <-- pass through
+                browser_name=os.getenv("BROWSER", "firefox"),   # env override if needed
+                trace=do_trace,                                 # <-- pass through
             )
+            log(f"[{rid_local}] ✅ Background worker finished")
         except Exception as e:
             log("==============================================")
-            log("Background job crashed")
-            log("----------------------------------------------")
-            log(str(e))
+            log(f"[{rid_local}] 🔥 Background worker crashed: {e}")
             log(traceback.format_exc())
             log("==============================================")
 
-    threading.Thread(target=_worker, daemon=True).start()
-    return JSONResponse({"message": "started"})
+    background_tasks.add_task(
+        run_worker,
+        rid,
+        file_path,
+        proxy,
+        haltOnCaptcha,
+        message,
+        useCaptcha,
+        current_user.id,
+        showBrowser,
+        trace,
+    )
+
+    return JSONResponse({"message": "started", "request_id": rid})
+
+@router.head("/logs/stream")
+def logs_stream_head() -> Response:
+    return Response(status_code=200)
 
 @router.get("/logs/stream")
-async def stream_logs(request):
-    return StreamingResponse(event_generator(request), media_type="text/event-stream")
+async def logs_stream(request: Request):
+    resp = event_generator(request)
+    if hasattr(resp, "__await__"):
+        return await resp
+    return resp

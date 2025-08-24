@@ -1,28 +1,18 @@
-# backend/app/core/database.py
-
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from decouple import config
+from app.core.config import settings
 
-# ⛓️ Get the DB connection URL from .env
-DATABASE_URL = config("DATABASE_URL")
+DATABASE_URL = settings.DB_URL  # unified accessor
 
-# ✅ Recommended for production: reconnect on idle disconnects
-# Optionally add echo=True for SQL debug logging
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,  # 🔄 automatically reconnects if idle connection is dead
-    echo=False           # 🔧 set to True to log SQL queries
-)
+engine_kwargs = dict(pool_pre_ping=True, pool_recycle=1800)
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
 
-# 🎛️ Create a database session factory
+engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# 🏗️ Base class for your SQLAlchemy models
-Base = declarative_base()
 
-# 🔄 Dependency for FastAPI routes
 def get_db():
     db = SessionLocal()
     try:

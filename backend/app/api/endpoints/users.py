@@ -1,95 +1,182 @@
-#
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status, Response
+# backend/app/api/endpoints/users.py
+from __future__ import annotations
+
+import os
+import logging
+from datetime import datetime, timedelta
+
+import jwt
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.api import deps
-from app.db import models, schemas
-from app.core import security
+from app.api.deps import get_current_active_user
+from app.db.database import get_db
+from app.db.models.user import User
+from app.db import schemas
+from app.utils.password import get_password_hash
+from app.utils.crypto import encrypt, decrypt
 
-router = APIRouter()
+router = APIRouter(prefix="/users", tags=["users"])
 
-# --- Existing routes for reading and updating users ---
+# ---- logger ----
+logger = logging.getLogger("app.users")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Current user
+# ──────────────────────────────────────────────────────────────────────────────
+
 @router.get("/me", response_model=schemas.User)
-def read_users_me(current_user: models.User = Depends(deps.get_current_active_user)):
+def me(current_user: User = Depends(get_current_active_user)):
     return current_user
 
-@router.get("/", response_model=List[schemas.User])
-def read_users(db: Session = Depends(deps.get_db), current_user: models.User = Depends(deps.get_current_admin_user)):
-    users = db.query(models.User).offset(0).limit(100).all()
-    return users
+# ──────────────────────────────────────────────────────────────────────────────
+# DeathByCaptcha settings
+#   User model columns:
+#     - captcha_username (text, nullable)
+#     - captcha_password_hash (text, nullable)  ← stored via attr captcha_password_encrypted
+# ──────────────────────────────────────────────────────────────────────────────
 
-@router.post("/", response_model=schemas.User, status_code=status.HTTP_201_CREATED)
-def create_user(
-    *,
-    db: Session = Depends(deps.get_db),
-    user_in: schemas.UserCreate,
-    current_user: models.User = Depends(deps.get_current_admin_user),
+@router.get("/captcha", response_model=schemas.CaptchaView)
+def get_captcha_settings(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
 ):
-    user = db.query(models.User).filter(models.User.email == user_in.email).first()
-    if user:
-        raise HTTPException(status_code=400, detail="User with this email already exists.")
-    
-    hashed_password = security.get_password_hash(user_in.password)
-    db_user = models.User(
-        first_name=user_in.first_name,
-        last_name=user_in.last_name,
-        email=user_in.email,
-        hashed_password=hashed_password,
-        role=user_in.role,
-        is_active=user_in.is_active
+    req_id = request.headers.get("x-request-id") or "-"
+    try:
+        has_user = bool((current_user.captcha_username or "").strip())
+        has_secret = bool((current_user.captcha_password_encrypted or "").strip())
+        has = has_user and has_secret
+
+        logger.info(
+            "GET /users/captcha start req_id=%s user_id=%s email=%s has_user=%s has_secret=%s",
+            req_id, current_user.id, current_user.email, has_user, has_secret
+        )
+
+        pwd = decrypt(current_user.captcha_password_encrypted) if has else ""
+        logger.info(
+            "GET /users/captcha ok req_id=%s user_id=%s has=%s pwd_len=%s",
+            req_id, current_user.id, has, (len(pwd) if pwd else 0)
+        )
+
+        return schemas.CaptchaView(
+            has_captcha=has,
+            captcha_username=current_user.captcha_username if has else None,
+            captcha_password=pwd if has else None,
+        )
+    except HTTPException:
+        # bubble up explicit HTTP errors
+        logger.exception("GET /users/captcha http-error req_id=%s user_id=%s", req_id, current_user.id)
+        raise
+    except Exception as e:
+        logger.exception("GET /users/captcha failed req_id=%s user_id=%s", req_id, current_user.id)
+        # Do not leak server internals to the client
+        raise HTTPException(status_code=500, detail="Failed to load captcha settings") from e
+
+
+@router.post("/captcha", response_model=schemas.CaptchaView)
+def set_captcha_settings(
+    payload: schemas.CaptchaUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    req_id = request.headers.get("x-request-id") or "-"
+    logger.info(
+        "POST /users/captcha start req_id=%s user_id=%s email=%s",
+        req_id, current_user.id, current_user.email
     )
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+    try:
+        username = (payload.captcha_username or "").strip()
+        password_clear = (payload.captcha_password.get_secret_value() if payload.captcha_password else "").strip()
 
-@router.put("/{user_id}", response_model=schemas.User)
-def update_user(
-    *,
-    db: Session = Depends(deps.get_db),
-    user_id: int,
-    user_in: schemas.UserUpdate,
-    current_user: models.User = Depends(deps.get_current_admin_user),
+        if not username or not password_clear:
+            logger.warning(
+                "POST /users/captcha validation req_id=%s user_id=%s missing_field username=%s pw_len=%s",
+                req_id, current_user.id, bool(username), len(password_clear)
+            )
+            raise HTTPException(status_code=422, detail="captcha_username and captcha_password are required")
+
+        # Encrypt may raise if key missing/invalid → caught below
+        encrypted = encrypt(password_clear)
+
+        # Persist
+        current_user.captcha_username = username
+        current_user.captcha_password_encrypted = encrypted  # maps to captcha_password_hash column
+        db.add(current_user)
+        db.commit()
+        db.refresh(current_user)
+
+        logger.info(
+            "POST /users/captcha ok req_id=%s user_id=%s stored_len=%s",
+            req_id, current_user.id, len(encrypted)
+        )
+        return schemas.CaptchaView(
+            has_captcha=True,
+            captcha_username=username,
+            captcha_password=password_clear,  # echo back for UI
+        )
+
+    except HTTPException:
+        # Don’t rollback on 4xx unless we wrote; but safe to rollback anyway
+        db.rollback()
+        logger.exception("POST /users/captcha http-error req_id=%s user_id=%s", req_id, current_user.id)
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("POST /users/captcha failed req_id=%s user_id=%s", req_id, current_user.id)
+        raise HTTPException(status_code=500, detail="Failed to save captcha settings") from e
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Password reset (token-based)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SECRET = os.getenv("PASSWORD_RESET_SECRET", "change-me")
+_EXP_MIN = int(os.getenv("PASSWORD_RESET_EXP_MINUTES", "30"))
+
+def _make_reset_token(user: User) -> str:
+    payload = {
+        "sub": str(user.id),
+        "email": user.email,
+        "exp": datetime.utcnow() + timedelta(minutes=_EXP_MIN),
+        "iat": datetime.utcnow(),
+        "typ": "pwreset",
+    }
+    return jwt.encode(payload, _SECRET, algorithm="HS256")
+
+def _decode_reset_token(token: str):
+    try:
+        return jwt.decode(token, _SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Reset link expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid reset link")
+
+@router.post("/password/request")
+def request_password_reset(
+    email: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
 ):
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    user = db.query(User).filter(User.email == email).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    if user.role == models.UserRole.owner and current_user.role != models.UserRole.owner:
-        raise HTTPException(status_code=403, detail="Admins cannot edit Owners")
+        return {"ok": True}
 
-    update_data = user_in.dict(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(user, field, value)
-    
+    token = _make_reset_token(user)
+    reset_url = f"{os.getenv('FRONTEND_BASE_URL','http://localhost:3000').rstrip('/')}/reset-password?token={token}"
+    return {"ok": True, "reset_url": reset_url}
+
+@router.post("/password/reset")
+def reset_password(
+    token: str = Body(..., embed=True),
+    new_password: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+):
+    data = _decode_reset_token(token)
+    user_id = data.get("sub")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="User not found")
+
+    user.hashed_password = get_password_hash(new_password)
     db.add(user)
     db.commit()
-    db.refresh(user)
-    return user
-
-# --- NEW DELETE ROUTE ---
-
-@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_user(
-    *,
-    db: Session = Depends(deps.get_db),
-    user_id: int,
-    current_user: models.User = Depends(deps.get_current_admin_user),
-):
-    """
-    Delete a user (Admins/Owners only).
-    """
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if user.id == current_user.id:
-        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
-    
-    if user.role == models.UserRole.owner and current_user.role != models.UserRole.owner:
-        raise HTTPException(status_code=403, detail="Admins cannot delete Owners.")
-
-    db.delete(user)
-    db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return {"ok": True}

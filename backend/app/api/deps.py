@@ -1,78 +1,68 @@
-# backend/app/api/deps.py
-
-from typing import Generator, Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import jwt, JWTError
-from pydantic import BaseModel, ValidationError
+from jose import jwt, ExpiredSignatureError, JWTError
 from sqlalchemy.orm import Session
+from uuid import UUID
 
-from app.db import models, schemas
-from app.core import security
 from app.core.config import settings
+from app.core.security import ALGORITHM
 from app.db.database import get_db
+from app.db.models.user import User as UserModel
 
-# ✅ Use direct path for login token (your project doesn't use /v1/)
-reusable_oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/login")
-
-
-# ✅ Updated TokenData schema to support `sub`
-class TokenData(BaseModel):
-    sub: Optional[str] = None  # <- used to extract user.id from token
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
-# ✅ Main user dependency
-def get_current_user(
-    db: Session = Depends(get_db), token: str = Depends(reusable_oauth2)
-) -> models.User:
+def _to_uuid(val: str):
     try:
+        return UUID(val)
+    except Exception:
+        return val  # fall back to raw string
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> UserModel:
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    try:
+        # ❗ python-jose does NOT support `leeway=` kwarg; remove it
         payload = jwt.decode(
-            token, settings.SECRET_KEY, algorithms=[security.ALGORITHM]
+            token,
+            settings.SECRET_KEY,
+            algorithms=[ALGORITHM],
+            options={"verify_aud": False},
         )
-        token_data = TokenData(**payload)
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
 
-        if not token_data.sub:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token: no user ID (sub)",
-            )
-
-        user = db.query(models.User).filter(models.User.id == token_data.sub).first()
-
+        user_id = _to_uuid(sub)
+        user = db.query(UserModel).filter(UserModel.id == user_id).first()
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        if not user.is_active:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
         return user
 
-    except (JWTError, ValidationError):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Could not validate credentials",
-        )
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
 
 
-def get_current_active_user(
-    current_user: models.User = Depends(get_current_user),
-) -> models.User:
-    if not current_user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
+def get_current_active_user(current_user: UserModel = Depends(get_current_user)) -> UserModel:
     return current_user
 
 
-def get_current_admin_user(
-    current_user: models.User = Depends(get_current_active_user),
-) -> models.User:
-    if current_user.role not in ["admin", "owner"]:
-        raise HTTPException(
-            status_code=403, detail="The user doesn't have enough privileges"
-        )
+def get_current_admin_user(current_user: UserModel = Depends(get_current_user)) -> UserModel:
+    if current_user.role not in ("admin", "owner"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     return current_user
 
 
-def get_current_owner_user(
-    current_user: models.User = Depends(get_current_active_user),
-) -> models.User:
+def get_current_owner_user(current_user: UserModel = Depends(get_current_user)) -> UserModel:
     if current_user.role != "owner":
-        raise HTTPException(
-            status_code=403, detail="The user doesn't have enough privileges"
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
     return current_user

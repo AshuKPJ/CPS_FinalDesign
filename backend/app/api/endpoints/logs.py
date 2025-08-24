@@ -1,11 +1,13 @@
 # backend/app/api/endpoints/logs.py
-
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
 from app.log_stream import event_generator
 
-router = APIRouter()
+router = APIRouter(tags=["logs"])
 
-@router.get("/logs/stream")
+@router.get("/stream")
 async def stream_logs(request: Request):
-    return StreamingResponse(event_generator(request), media_type="text/event-stream")
+    # event_generator returns a StreamingResponse; return it directly
+    resp = event_generator(request)
+    if hasattr(resp, "__await__"):
+        return await resp
+    return resp

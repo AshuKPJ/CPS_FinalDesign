@@ -1,28 +1,43 @@
-# backend/app/db/models/website.py
-
-import uuid
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Column, String, Text, Boolean, Integer, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 from sqlalchemy.orm import relationship
-from datetime import datetime
+import uuid
+
 from app.db.base_class import Base
 
 class Website(Base):
     __tablename__ = "websites"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    campaign_id = Column(UUID(as_uuid=True), ForeignKey("campaigns.id"), nullable=False)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
 
-    website_url = Column(String, nullable=False)
-    domain = Column(String, nullable=True)
-    contact_page_url = Column(String, nullable=True)
-    has_contact_form = Column(Boolean, default=False)
+    campaign_id = Column(UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # from Excel
+    domain = Column(String(255), nullable=True)
+    status = Column(String(50), nullable=True)
+    contact_url = Column(Text, nullable=True)
+    created_at = Column(None, nullable=True)  # TIMESTAMP WITHOUT TIME ZONE (nullable per Excel)
 
-    campaign = relationship("Campaign", back_populates="websites")
+    form_detected = Column(Boolean, nullable=True)
+    form_field_count = Column(Integer, nullable=True)
+    form_field_types = Column(JSONB, nullable=True)
+    form_field_options = Column(JSONB, nullable=True)
+    form_labels = Column(ARRAY(Text), nullable=True)
+    form_name_variants = Column(ARRAY(Text), nullable=True)
+    form_type = Column(String(100), nullable=True)
+    has_captcha = Column(Boolean, nullable=True)
+    captcha_type = Column(String(100), nullable=True)
+    captcha_difficulty = Column(Text, nullable=True)
+    captcha_solution_time = Column(Integer, nullable=True)
+    captcha_metadata = Column(JSONB, nullable=True)
+    requires_proxy = Column(Boolean, nullable=True)
+    proxy_block_type = Column(Text, nullable=True)
+    last_proxy_used = Column(Text, nullable=True)
+    failure_reason = Column(Text, nullable=True)
+    question_answer_fields = Column(JSONB, nullable=True)
+
     user = relationship("User", back_populates="websites")
-    submissions = relationship("Submission", back_populates="website", cascade="all, delete-orphan")
-    logs = relationship("Log", back_populates="website", cascade="all, delete-orphan")
+    campaign = relationship("Campaign", back_populates="websites")
+    submissions = relationship("Submission", back_populates="website")
+    logs = relationship("Log", back_populates="website")
