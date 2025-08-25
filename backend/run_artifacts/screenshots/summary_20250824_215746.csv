@@ -1,0 +1,3 @@
+idx,input_url,final_url,method,status,reason,emails_count,shot_loaded,shot_contact,shot_captcha,shot_submit_error,shot_postsubmit,shot_nav_fail
+2,soildistrict.org,https://soildistrict.org/contact/,form,fail,captcha,0,run_artifacts\screenshots\row2_20250824_215702_583630_loaded.png,run_artifacts\screenshots\row2_20250824_215702_583630_contact.png,,,,
+3,valleyhealth.com,https://www.valleyhealth.com/contact-us,form,fail,captcha,0,run_artifacts\screenshots\row3_20250824_215728_879324_loaded.png,run_artifacts\screenshots\row3_20250824_215728_879324_contact.png,,,,

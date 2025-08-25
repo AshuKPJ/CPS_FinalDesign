@@ -1,0 +1,28 @@
+[
+  {
+    "idx": 2,
+    "input_url": "soildistrict.org",
+    "final_url": "https://soildistrict.org/contact/",
+    "method": "form",
+    "status": "fail",
+    "reason": "captcha",
+    "emails": [],
+    "shots": {
+      "contact": "run_artifacts\\screenshots\\row2_20250824_224613_850879_contact.png",
+      "loaded": "run_artifacts\\screenshots\\row2_20250824_224613_850879_loaded.png"
+    }
+  },
+  {
+    "idx": 3,
+    "input_url": "valleyhealth.com",
+    "final_url": "https://www.valleyhealth.com/contact-us",
+    "method": "form",
+    "status": "fail",
+    "reason": "captcha",
+    "emails": [],
+    "shots": {
+      "contact": "run_artifacts\\screenshots\\row3_20250824_224638_690267_contact.png",
+      "loaded": "run_artifacts\\screenshots\\row3_20250824_224638_690267_loaded.png"
+    }
+  }
+]
